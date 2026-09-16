@@ -310,7 +310,22 @@ function runOldLedgerMigration() {
       ok(/导入被拒绝/.test(rejectMsg) && /冻结快照/.test(rejectMsg), "【损坏档】界面导入被拒绝并说明原因");
       const after = JSON.parse(wB.localStorage.getItem("zfl31Settlement"));
       ok(after.sheets[0].status === "confirmed" && after.sheets[0].frozen, "【损坏档】坏档未落库，原台账保持完好");
-      finish();
+
+      // 场景 D：明细伪造——改分段班次名称、总额不变（重算校验和绕开篡改检测）
+      const fake = wB.Payroll.exportBundle(after);
+      fake.payload.data.sheets[0].frozen.result.lines[0].segments[0].shift = "伪造班次";
+      const fakeFile = new wB.File([JSON.stringify({ v: 1, payload: fake.payload, checksum: wB.Payroll.checksum(fake.payload) })],
+        "fake-detail.json", { type: "application/json" });
+      Object.defineProperty(inp2, "files", { value: [fakeFile], configurable: true });
+      inp2.dispatchEvent(new wB.Event("change", { bubbles: true }));
+      setTimeout(() => {
+        const m2 = dB.querySelector("#sMsg").textContent;
+        ok(/导入被拒绝/.test(m2) && /班次/.test(m2), "【明细伪造】改班次名称（总额不变）导入被拒绝");
+        const kept = JSON.parse(wB.localStorage.getItem("zfl31Settlement"));
+        const seg0 = kept.sheets[0].frozen.result.lines[0].segments[0];
+        ok(seg0.shift !== "伪造班次", "【明细伪造】伪造内容未落库");
+        finish();
+      }, 200);
     }, 200);
   }, 200);
 }

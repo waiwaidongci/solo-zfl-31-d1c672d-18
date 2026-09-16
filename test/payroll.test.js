@@ -627,6 +627,112 @@ test("【损坏档】校验和失败仍优先报篡改（结构校验不掩盖�
   expectThrow(() => P.importBundle(file), "校验和");
 });
 
+/* ---------- 明细篡改回归：总额不变也必须逐项一致 ---------- */
+
+// 跨班次确认单：21:00-23:00（中班1h+夜班1h）+ 一段加班，便于验证分段/加班逐项核对
+function segmentedConfirmedLedger() {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  P.addEntry(db, sh.id, {
+    processKey: "weaving", date: "2026-09-14", start: "21:00", end: "23:00", qty: 100,
+    overtimes: [{ date: "2026-09-15", start: "01:00", end: "03:00" }]
+  });
+  const res = P.confirmSheet(db, sh.id);
+  return { db: db, sh: sh, res: res };
+}
+
+test("【明细篡改】正常跨班次确认单复核逐分一致", () => {
+  const { db, res } = segmentedConfirmedLedger();
+  const audit = P.auditData(db);
+  assert.ok(audit.ok, JSON.stringify(audit.sheets, null, 2));
+  assert.strictEqual(res.lines[0].segments.length, 2); // 中班 + 夜班
+  assert.strictEqual(res.lines[0].overtimes.length, 1);
+  // 正常导出导入
+  const imp = P.importBundle(P.exportBundle(db).file);
+  assert.ok(imp.report.ok);
+});
+
+test("【明细篡改】改分段班次名称（总额不变）→ 复核/导入拒绝", () => {
+  const { db } = segmentedConfirmedLedger();
+  const line = () => db.sheets[0].frozen.result.lines[0];
+  const orig = line().segments[0].shift;
+  line().segments[0].shift = "伪造班次";
+  // 合计完全没动
+  assert.strictEqual(P.auditData(db).ok, false);
+  expectThrow(() => P.importBundle(tamperedFile(db, d => {
+    d.sheets[0].frozen.result.lines[0].segments[0].shift = "伪造班次";
+  })), "复核不通过");
+  assert.ok(/班次/.test(P.auditData(db).sheets[0].errors.join()));
+  line().segments[0].shift = orig;
+  assert.ok(P.auditData(db).ok);
+});
+
+test("【明细篡改】改分段分钟数/金额并找平总额 → 拒绝", () => {
+  // 分钟数：两段各 60 分钟，改成 30/90
+  expectThrow(() => P.importBundle(tamperedFile(segmentedConfirmedLedger().db, d => {
+    d.sheets[0].frozen.result.lines[0].segments[0].minutes = 30;
+    d.sheets[0].frozen.result.lines[0].segments[1].minutes = 90;
+  })), "minutes");
+  // 段金额：把第一段金额挪给第二段（总额不变）
+  expectThrow(() => P.importBundle(tamperedFile(segmentedConfirmedLedger().db, d => {
+    const segs = d.sheets[0].frozen.result.lines[0].segments;
+    segs[0].amount = P.r2(segs[0].amount - 10);
+    segs[1].amount = P.r2(segs[1].amount + 10);
+  })), "amount");
+  // 分段日期伪造
+  expectThrow(() => P.importBundle(tamperedFile(segmentedConfirmedLedger().db, d => {
+    d.sheets[0].frozen.result.lines[0].segments[1].date = "2026-09-20";
+  })), "date");
+});
+
+test("【明细篡改】插入伪造加班记录但保持加班总额 → 拒绝", () => {
+  const { db } = segmentedConfirmedLedger();
+  // 把原加班 2h 拆成两条 1h（总额同为 100），段数不一致必须暴露
+  const file = tamperedFile(db, d => {
+    const line = d.sheets[0].frozen.result.lines[0];
+    line.overtimes = [
+      { date: "2026-09-15", start: "01:00", end: "02:00", minutes: 60, holiday: false, multiplier: 2, amount: 50 },
+      { date: "2026-09-15", start: "02:00", end: "03:00", minutes: 60, holiday: false, multiplier: 2, amount: 50 }
+    ];
+  });
+  expectThrow(() => P.importBundle(file), "加班段数不一致");
+
+  // 同段数但改加班日期/金额找平 → 逐项比对拒绝
+  expectThrow(() => P.importBundle(tamperedFile(segmentedConfirmedLedger().db, d => {
+    d.sheets[0].frozen.result.lines[0].overtimes[0].date = "2026-09-20";
+  })), "加班#1 的 date");
+});
+
+test("【明细篡改】行间挪账：每行内部找平、整单总额不变 → 拒绝", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  P.addEntry(db, sh.id, { processKey: "weaving", date: "2026-09-14", start: "09:00", end: "11:00", qty: 10 });
+  P.addEntry(db, sh.id, { processKey: "weaving", date: "2026-09-15", start: "09:00", end: "11:00", qty: 20 });
+  P.confirmSheet(db, sh.id);
+  const file = tamperedFile(db, d => {
+    const lines = d.sheets[0].frozen.result.lines;
+    // 每行分项与小计一起挪 8 元：行内仍平、整单总额仍平，但行间分配是伪造的
+    lines[0].piecePay = P.r2(lines[0].piecePay + 8);
+    lines[0].gross = P.r2(lines[0].gross + 8);
+    lines[1].piecePay = P.r2(lines[1].piecePay - 8);
+    lines[1].gross = P.r2(lines[1].gross - 8);
+  });
+  expectThrow(() => P.importBundle(file), "piecePay");
+});
+
+test("【明细篡改】篡改单据录入但冻结金额不变 → 拒绝", () => {
+  // entries 日期被改，重算结果日期与冻结行不符
+  expectThrow(() => P.importBundle(tamperedFile(segmentedConfirmedLedger().db, d => {
+    d.sheets[0].entries[0].date = "2026-09-20";
+  })), "日期不一致");
+  // entries 数量被改，重算金额自然不等
+  expectThrow(() => P.importBundle(tamperedFile(segmentedConfirmedLedger().db, d => {
+    d.sheets[0].entries[0].qty = 50;
+  })), "qty");
+});
+
 /* ---------- 导出/导入复核 ---------- */
 test("导出再导入复核同一结果", () => {
   const { db, sh } = draftSheet();

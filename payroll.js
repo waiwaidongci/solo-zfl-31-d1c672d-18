@@ -371,6 +371,8 @@
     allowance = r2(allowance);
 
     return {
+      processKey: entry.processKey, date: entry.date,
+      start: entry.start || "", end: entry.end || "",
       rateId: rate.id, price: price, reworkFactor: factor,
       planQty: planQ, pieces: pieces, qty: qty, reworkQty: reworkQty,
       segments: pieceSegs, totalMinutes: totalMin,
@@ -795,6 +797,76 @@
     return { data: data, pattern: bundle.payload.pattern || null, report: report, checksum: bundle.checksum };
   }
 
+  // 逐行逐项比对冻结结果与按冻结规则重算的结果；返回差异描述数组（空=完全一致）。
+  // 总额一致不能代替明细一致：分段日期/班次/分钟/金额、加班时段都必须逐项相同。
+  function diffResults(frozen, recalced, sheet) {
+    var diffs = [];
+    var fl = frozen.lines, rl = recalced.lines;
+    if (!Array.isArray(fl) || !Array.isArray(rl)) return ["结果缺少明细行"];
+    if (fl.length !== rl.length) return ["明细行数不一致：冻结 " + fl.length + " 行，重算 " + rl.length + " 行（疑似插入/删除伪造明细）"];
+    var entries = sheet && Array.isArray(sheet.entries) ? sheet.entries : null;
+    if (entries && entries.length !== fl.length) {
+      diffs.push("单据明细 " + entries.length + " 条与冻结明细 " + fl.length + " 行不一致（疑似插入/删除伪造明细）");
+    }
+    var eq = function (a, b) { return String(a) === String(b); };
+    var eqN = function (a, b) { return isNum(a) && isNum(b) && r2(a) === r2(b); };
+
+    fl.forEach(function (f, i) {
+      var r = rl[i], p = "明细#" + (i + 1);
+      // 旧版冻结行可能没带 processKey/date/start/end，用单据上的录入补齐比对
+      var en = entries && entries[i] ? entries[i] : {};
+      var fKey = f.processKey != null ? f.processKey : en.processKey;
+      var fDate = f.date != null ? f.date : en.date;
+      if (!eq(fKey, r.processKey)) diffs.push(p + " 的工序不一致：冻结 " + fKey + "，重算 " + r.processKey);
+      if (!eq(fDate, r.date)) diffs.push(p + " 的日期不一致：冻结 " + fDate + "，重算 " + r.date);
+      var numFields = [["rateId", eq], ["qty", eqN], ["reworkQty", eqN],
+       ["piecePay", eqN], ["reworkPay", eqN], ["overtimePay", eqN], ["allowance", eqN],
+       ["gross", eqN], ["totalMinutes", eqN]];
+      // pieces/price 旧版冻结行可能缺失：仅当冻结值存在时才比对
+      if (f.pieces !== undefined) numFields.push(["pieces", eqN]);
+      if (f.price !== undefined) numFields.push(["price", eqN]);
+      numFields.forEach(function (pair) {
+        var k = pair[0], same = pair[1];
+        if (!same(f[k], r[k])) diffs.push(p + " 的 " + k + " 不一致：冻结 " + f[k] + "，重算 " + r[k]);
+      });
+
+      // 分段：日期、班次引用与名称、分钟数、节假日倍数、金额逐项一致
+      var fs = f.segments || [], rs = r.segments || [];
+      if (fs.length !== rs.length) {
+        diffs.push(p + " 分段数不一致：冻结 " + fs.length + "，重算 " + rs.length);
+      } else {
+        fs.forEach(function (sg, j) {
+          var rg = rs[j], sp = p + " 分段#" + (j + 1);
+          [["date", eq],
+           ["shiftId", function (a, b) {
+             // 旧版冻结分段可能没有 shiftId 字段：此时仅按班次名称核对
+             if (a === undefined || a === null) return true;
+             return (a || null) === (b || null);
+           }],
+           ["shift", eq], ["minutes", eqN], ["mult", eqN], ["amount", eqN]].forEach(function (pair2) {
+            var k = pair2[0], same = pair2[1];
+            if (!same(sg[k], rg[k])) diffs.push(sp + " 的 " + k + " 不一致：冻结 " + sg[k] + "，重算 " + rg[k]);
+          });
+        });
+      }
+
+      // 加班时段：日期/起止/分钟/倍数/金额逐项一致（插入或删除假加班会在此暴露）
+      var fo = f.overtimes || [], ro = r.overtimes || [];
+      if (fo.length !== ro.length) {
+        diffs.push(p + " 加班段数不一致：冻结 " + fo.length + "，重算 " + ro.length + "（疑似插入/删除伪造加班）");
+      } else {
+        fo.forEach(function (o, j) {
+          var x = ro[j], op = p + " 加班#" + (j + 1);
+          [["date", eq], ["start", eq], ["end", eq], ["minutes", eqN], ["multiplier", eqN], ["amount", eqN]].forEach(function (pair2) {
+            var k = pair2[0], same = pair2[1];
+            if (!same(o[k], x[k])) diffs.push(op + " 的 " + k + " 不一致：冻结 " + o[k] + "，重算 " + x[k]);
+          });
+        });
+      }
+    });
+    return diffs;
+  }
+
   // 对整库做复核；draft 用当前规则严格重算；
   // confirmed 始终按其冻结规则以 legacy 模式重算（不套用升级后的新录入规则）并逐分比对。
   function auditData(db) {
@@ -839,6 +911,11 @@
               row.ok = false;
               row.errors.push("冻结 " + f + "=" + frozen[f] + " 与重算 " + now[f] + " 不一致");
             }
+          });
+          // 逐行逐项核对明细：总额一致也不能放过被篡改的分段/加班
+          diffResults(sheet.frozen.result, recalced, sheet).forEach(function (d) {
+            row.ok = false;
+            row.errors.push(d);
           });
           var netWithAdj = currentNet(db, sheet);
           row.net = netWithAdj;
