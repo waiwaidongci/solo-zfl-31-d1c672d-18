@@ -139,6 +139,65 @@ clickAct(win, doc.querySelector("#settleRoot"), "back");
 clickAct(win, doc.querySelector("#settleRoot"), "audit");
 ok(/完全一致/.test(msg(dom)), "复核：冻结结果与重算一致");
 
+// 10b. 【回归】确认后的单不冻结未引用规则：未使用的单价可改，重叠班次被拦截
+[...doc.querySelectorAll("[data-act=tab]")].find(b => b.dataset.tab === "rules").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+// 给未使用的“整理整修”改 2026-01-01 历史价（0.5 → 0.6），应成功
+{
+  const card = [...doc.querySelectorAll("[data-box=rate]")].find(b => b.querySelector("[data-key=finishing]"));
+  setVal(card.querySelector("[name=from]"), "2026-01-01");
+  setVal(card.querySelector("[name=price]"), "0.6");
+  card.querySelector("[data-act=setRate]").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+  ok(/单价成功/.test(msg(dom)), "确认后仍可修改未被引用的历史单价");
+  //  weaving 同日历史价（已被确认单引用）改价应被锁定拦截
+  const wcard = [...doc.querySelectorAll("[data-box=rate]")].find(b => b.querySelector("[data-key=weaving]"));
+  setVal(wcard.querySelector("[name=from]"), "2026-01-01");
+  setVal(wcard.querySelector("[name=price]"), "5");
+  wcard.querySelector("[data-act=setRate]").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+  ok(/锁定/.test(msg(dom)), "已被确认单引用的单价不能改");
+  // 但新增更晚生效价是允许的，且不影响已确认单
+  setVal(wcard.querySelector("[name=from]"), "2026-12-01");
+  setVal(wcard.querySelector("[name=price]"), "5");
+  wcard.querySelector("[data-act=setRate]").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+  ok(/单价成功/.test(msg(dom)), "新增更晚生效价允许（不影响锁定单）");
+}
+// 保存一个与早班重叠的新班次 → 拦截
+{
+  const box = doc.querySelector('[data-box="shift"]');
+  setVal(box.querySelector("[name=name]"), "插班");
+  setVal(box.querySelector("[name=start]"), "13:00");
+  setVal(box.querySelector("[name=end]"), "15:00");
+  setVal(box.querySelector("[name=allowance]"), "0");
+  clickAct(win, doc.querySelector("#settleRoot"), "setShift");
+  ok(/重叠/.test(msg(dom)), "重叠班次保存被拦截");
+  const live = JSON.parse(win.localStorage.getItem("zfl31Settlement"));
+  ok(!live.shifts.some(s => s.name === "插班"), "被拦截的重叠班次未入库");
+}
+
+// 10c. 【回归】新建草稿：周期外加班（生产在本月、加班在下月）不能确认
+[...doc.querySelectorAll("[data-act=tab]")].find(b => b.dataset.tab === "sheets").dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+clickAct(win, doc.querySelector("#settleRoot"), "addSheet");
+const sh2Id = JSON.parse(win.localStorage.getItem("zfl31Settlement")).sheets.sort((a,b)=>a.createdAt.localeCompare(b.createdAt)).slice(-1)[0].id;
+[...doc.querySelectorAll('[data-act="edit"]')].find(b => b.dataset.id === sh2Id).dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+// 显式设为 9 月周期，避免依赖运行机当天日期
+setVal(doc.querySelector('[data-box="head"] [name=periodStart]'), "2026-09-01");
+setVal(doc.querySelector('[data-box="head"] [name=periodEnd]'), "2026-09-30");
+clickAct(win, doc.querySelector("#settleRoot"), "saveHead");
+setVal(doc.querySelector('[data-box="entry"] [name=processKey]'), "weaving");
+setVal(doc.querySelector('[data-box="entry"] [name=date]'), "2026-09-15");
+setVal(doc.querySelector('[data-box="entry"] [name=qty]'), "10");
+setVal(doc.querySelector('[data-box="entry"] [name=start]'), "09:00");
+setVal(doc.querySelector('[data-box="entry"] [name=end]'), "11:00");
+setVal(doc.querySelector('[data-box="entry"] [name=ot1date]'), "2026-10-01"); // 周期（9月）外
+setVal(doc.querySelector('[data-box="entry"] [name=ot1start]'), "09:00");
+setVal(doc.querySelector('[data-box="entry"] [name=ot1end]'), "10:00");
+clickAct(win, doc.querySelector("#settleRoot"), "addEntry");
+ok(/不在结算周期/.test(msg(dom)), "周期外加班明细被拦截（生产日期在周期内也不行）");
+ok(JSON.parse(win.localStorage.getItem("zfl31Settlement")).sheets.find(s=>s.id===sh2Id).entries.length === 0, "非法加班明细未入表");
+clickAct(win, doc.querySelector("#settleRoot"), "back");
+// 删除这张空草稿，避免污染后续导出复核
+doc.querySelector('[data-act="deleteSheet"][data-id="' + sh2Id + '"]').dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+ok(JSON.parse(win.localStorage.getItem("zfl31Settlement")).sheets.length === 1, "空草稿已删除");
+
 // 11. 导出 → 全新环境导入，复核同一结果
 let exported = "";
 {

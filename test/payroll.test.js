@@ -187,6 +187,126 @@ test("空明细不能确认", () => {
   expectThrow(() => P.confirmSheet(db, sh.id), "没有任何");
 });
 
+/* ---------- 边界回归：加班日期 / 重叠班次 / 精确冻结 ---------- */
+
+test("【回归】周期外加班被拦截（即使生产日期在周期内）", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  // 入表即拦：生产在 9 月内，加班却落在 10/01（周期外）
+  expectThrow(() => P.addEntry(db, sh.id, {
+    processKey: "weaving", date: "2026-09-30", start: "09:00", end: "11:00", qty: 10,
+    overtimes: [{ date: "2026-10-01", start: "09:00", end: "10:00" }]
+  }), "不在结算周期");
+  assert.strictEqual(sh.entries.length, 0);
+
+  // 兜底：直接构造的脏数据（如旧档/导入档）在试算与确认时同样被拦
+  sh.entries = [{ processKey: "weaving", date: "2026-09-30", start: "09:00", end: "11:00",
+    pieces: 1, qty: 10, reworkQty: 0, overtimes: [{ date: "2026-10-01", start: "09:00", end: "10:00" }] }];
+  expectThrow(() => P.calcSheet(db, sh), "不在结算周期");
+  expectThrow(() => P.confirmSheet(db, sh.id), "不在结算周期");
+  // 确认失败不留半单
+  assert.strictEqual(sh.status, "draft");
+  assert.ok(!sh.frozen);
+
+  // 同一段加班挪回周期内即可确认
+  sh.entries[0].overtimes = [{ date: "2026-09-29", start: "19:00", end: "20:00" }];
+  const res = P.confirmSheet(db, sh.id);
+  assert.strictEqual(res.totals.overtimePay, P.r2(1 * 25 * 2)); // 日常加班 2 倍
+});
+
+test("【回归】新增/修改重叠班次被拦截（含跨夜与端点相接）", () => {
+  const db = P.defaultData();
+  db.shifts = [
+    { id: "s1", name: "早班", start: "06:00", end: "12:00", allowance: 0 },
+    { id: "s2", name: "夜班", start: "22:00", end: "06:00", allowance: 0 }
+  ];
+  // 与早班部分重叠
+  expectThrow(() => P.setShift(db, { name: "插班", start: "11:00", end: "13:00", allowance: 0 }), "重叠");
+  // 与跨夜夜班 22:00-06:00 重叠（05:00-07:00 压到夜班尾）
+  expectThrow(() => P.setShift(db, { name: "深夜班", start: "05:00", end: "07:00", allowance: 0 }), "重叠");
+  // 端点相接（半开区间）合法：12:00-22:00 两端分别贴早班、夜班
+  const t = P.setShift(db, { name: "衔接班", start: "12:00", end: "22:00", allowance: 0 });
+  assert.ok(t.id);
+  // 改成重叠时段被拒绝
+  expectThrow(() => P.setShift(db, { id: t.id, name: "衔接班", start: "11:30", end: "22:00", allowance: 0 }), "重叠");
+  // 数据未被半改：仍是原时间
+  const after = db.shifts.find(s => s.id === t.id);
+  assert.strictEqual(after.start, "12:00");
+  assert.strictEqual(after.end, "22:00");
+});
+
+test("【回归】合法班次修改后草稿实时重算、确认单不受影响且一致", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  P.addEntry(db, sh.id, { processKey: "weaving", date: "2026-09-14", start: "09:00", end: "11:00", qty: 100 });
+  // 确认前：早班津贴 5
+  assert.strictEqual(P.calcSheet(db, sh).totals.allowance, 5);
+  // 确认
+  const confirmed = P.confirmSheet(db, sh.id);
+  assert.strictEqual(confirmed.totals.allowance, 5);
+  // 已确认单引用的班次不能改
+  expectThrow(() => P.setShift(db, { id: "s1", name: "早班", start: "06:00", end: "14:00", allowance: 99 }), "锁定");
+  // 未引用的中班津贴可改，且不影响已确认单
+  P.setShift(db, { id: "s2", name: "中班", start: "14:00", end: "22:00", allowance: 88 });
+  const audit = P.auditData(db);
+  assert.ok(audit.ok, JSON.stringify(audit.sheets, null, 2));
+  assert.strictEqual(db.sheets[0].frozen.result.totals.allowance, 5);
+});
+
+test("【回归】确认后未引用的历史单价/班次仍可修改，引用的被锁定", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  // 给“整理整修”配一条价（本单不会录入该工序）
+  P.setRate(db, { processKey: "finishing", from: "2026-01-01", price: 0.55 });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  P.addEntry(db, sh.id, { processKey: "weaving", date: "2026-09-14", start: "09:00", end: "11:00", qty: 100 });
+  P.confirmSheet(db, sh.id);
+
+  // 冻结快照只含实际引用的规则
+  assert.deepStrictEqual(sh.frozen.rates.map(r => r.processKey).sort(), ["weaving"]);
+  // 工作时间 09-11 只命中早班
+  assert.deepStrictEqual(sh.frozen.shifts.map(s => s.name), ["早班"]);
+
+  // 未被引用的 finishing 历史单价可以改
+  const finRate = db.rates.find(r => r.processKey === "finishing");
+  assert.strictEqual(P.rateIsFrozen(db, finRate.id), false);
+  P.setRate(db, { processKey: "finishing", from: "2026-01-01", price: 0.7 });
+  assert.strictEqual(P.rateAt(db, "finishing", "2026-09-14").price, 0.7);
+  // 未被引用的夜班/中班也能改
+  assert.strictEqual(P.shiftIsFrozen(db, "s2"), false);
+  assert.strictEqual(P.shiftIsFrozen(db, "s3"), false);
+  P.setShift(db, { id: "s3", name: "夜班", start: "22:30", end: "05:30", allowance: 20 });
+
+  // 实际引用的 weaving 单价与早班仍被锁定
+  const weaveRate = db.rates.find(r => r.processKey === "weaving" && r.from === "2026-01-01");
+  assert.strictEqual(P.rateIsFrozen(db, weaveRate.id), true);
+  expectThrow(() => P.setRate(db, { processKey: "weaving", from: "2026-01-01", price: 5 }), "锁定");
+  assert.strictEqual(P.shiftIsFrozen(db, "s1"), true);
+  expectThrow(() => P.setShift(db, { id: "s1", name: "早班", start: "06:00", end: "14:00", allowance: 9 }), "锁定");
+
+  // 复核仍然一致
+  assert.ok(P.auditData(db).ok);
+});
+
+test("【回归】只锁定实际引用的节假日，未引用日期可自由增删", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  P.toggleHoliday(db, "2026-10-01"); // 本单用到
+  P.toggleHoliday(db, "2026-05-01"); // 本单不用
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-15", periodEnd: "2026-10-05" });
+  P.addEntry(db, sh.id, { processKey: "weaving", date: "2026-10-01", start: "09:00", end: "11:00", qty: 10 });
+  P.confirmSheet(db, sh.id);
+  // 冻结节假日只含实际引用的一天
+  assert.deepStrictEqual(sh.frozen.holidays, ["2026-10-01"]);
+  // 引用日不能取消
+  expectThrow(() => P.toggleHoliday(db, "2026-10-01"), "锁定");
+  // 未引用日可自由删除，且不影响已确认单复核
+  P.toggleHoliday(db, "2026-05-01");
+  assert.ok(P.auditData(db).ok);
+});
+
 /* ---------- 导出/导入复核 ---------- */
 test("导出再导入复核同一结果", () => {
   const { db, sh } = draftSheet();

@@ -215,7 +215,9 @@
           : '<button class="tiny ghost" data-act="editShift" data-id="' + s.id + '">编辑</button>') + "</td></tr>";
     }).join("");
     const holRows = db.holidays.map(d => "<tr><td>" + d + "</td>" +
-      '<td><button class="tiny danger" data-act="delHoliday" data-date="' + d + '">取消节假日</button></td></tr>').join("");
+      "<td>" + (P.holidayIsFrozen && P.holidayIsFrozen(db, d)
+        ? '<span class="badge confirmed">已锁定</span>'
+        : '<button class="tiny danger" data-act="delHoliday" data-date="' + d + '">取消节假日</button>') + "</td></tr>").join("");
 
     return '<div class="s-grid">' +
       '<div class="s-card"><h3>织工</h3>' +
@@ -346,9 +348,9 @@
         "<label>完成量<input type='number' min='0' step='1' name='qty' value='0'></label>" +
         "<label>返工量<input type='number' min='0' step='1' name='reworkQty' value='0'></label>" +
         "<label>件数(完成几件)<input type='number' min='1' step='1' name='pieces' value='1'></label>" +
-        "<label>加班1日期<input type='date' name='ot1date'></label>" +
+        "<label>加班1日期<input type='date' name='ot1date' min='" + sh.periodStart + "' max='" + sh.periodEnd + "'></label>" +
         "<label>起<input type='time' name='ot1start'></label><label>止<input type='time' name='ot1end'></label>" +
-        "<label>加班2日期<input type='date' name='ot2date'></label>" +
+        "<label>加班2日期<input type='date' name='ot2date' min='" + sh.periodStart + "' max='" + sh.periodEnd + "'></label>" +
         "<label>起<input type='time' name='ot2start'></label><label>止<input type='time' name='ot2end'></label>" +
         '<p style="grid-column:1/-1;margin:4px 0"><button class="tiny" data-act="addEntry">加入明细（先试算再入表）</button> ' +
         "<span class='muted'>返工按工序返工系数计，不享节假日倍数；加班不得与正常班次重叠。</span></p>" +

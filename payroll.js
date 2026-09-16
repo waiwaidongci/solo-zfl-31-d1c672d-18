@@ -167,6 +167,21 @@
     return [{ start: start, end: end }];
   }
   function overlap(a, b) { return Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start)); }
+  // 班次在时钟上的半开区间（跨夜则 end 加一天）
+  function shiftRange(start, end) {
+    var s = hm(start), e = hm(end);
+    if (e <= s) e += 1440;
+    return { start: s, end: e };
+  }
+  // 两个班次（允许跨夜）是否有正时长重叠；端点相接不算重叠
+  function shiftsOverlap(a, b) {
+    var ra = shiftRange(a.start, a.end);
+    var rb = shiftRange(b.start, b.end);
+    for (var k = -1; k <= 1; k++) {
+      if (overlap(ra, { start: rb.start + k * 1440, end: rb.end + k * 1440 }) > 0) return true;
+    }
+    return false;
+  }
 
   // 把一段工作时间按“班次 × 是否节假日”切成计薪段
   // 输入：date + start/end（end<=start 视为跨夜）
@@ -265,7 +280,9 @@
     var pieceSegs = weighted.map(function (x) {
       var amount = r2(basePiece * (x.w * x.mult) / weightSum);
       return {
-        shift: x.sg.shiftName, date: x.sg.date, minutes: x.sg.minutes,
+        shift: x.sg.shiftName,
+        shiftId: x.sg.shiftId,
+        date: x.sg.date, minutes: x.sg.minutes,
         holiday: x.sg.holiday, mult: x.mult, amount: amount
       };
     });
@@ -343,6 +360,12 @@
       if (dayOrd(en.date) < dayOrd(sheet.periodStart) || dayOrd(en.date) > dayOrd(sheet.periodEnd)) {
         throw new Error("明细日期 " + en.date + " 不在结算周期内");
       }
+      // 每段加班同样必须落在结算周期内（加班日期与生产日期可以不同，如跨月加班）
+      (en.overtimes || []).forEach(function (o) {
+        if (dayOrd(o.date) < dayOrd(sheet.periodStart) || dayOrd(o.date) > dayOrd(sheet.periodEnd)) {
+          throw new Error("加班日期 " + o.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
+        }
+      });
       return calcEntry(db, en);
     });
 
@@ -357,10 +380,29 @@
     var net = r2(gross - advance - otherDeduction);
     if (net < 0) throw new Error("应发净额为负（" + net + " 元）：预支 " + advance + "、扣款 " + otherDeduction + " 超过应付 " + gross);
 
+    // 收集本单实际引用的计价规则，供确认时精确冻结（未引用的规则不锁）
+    var rateIds = {}, shiftIds = {}, refDates = {};
+    lines.forEach(function (l) {
+      if (l.rateId) rateIds[l.rateId] = true;
+      l.segments.forEach(function (sg) {
+        if (sg.shiftId) shiftIds[sg.shiftId] = true;
+        if (sg.date) refDates[sg.date] = true;
+      });
+    });
+    sheet.entries.forEach(function (en) {
+      refDates[en.date] = true;
+      (en.overtimes || []).forEach(function (o) { refDates[o.date] = true; });
+    });
+
     return {
       weaverId: sheet.weaverId, weaverName: weaver.name,
       periodStart: sheet.periodStart, periodEnd: sheet.periodEnd,
       lines: lines,
+      referenced: {
+        rateIds: Object.keys(rateIds),
+        shiftIds: Object.keys(shiftIds),
+        dates: Object.keys(refDates)
+      },
       totals: {
         piecePay: piecePay, reworkPay: reworkPay, overtimePay: overtimePay,
         allowance: allowance, gross: gross, advance: advance,
@@ -388,14 +430,19 @@
     // 全部校验通过后才落库 —— 失败不留半张工资单
     var result = calcSheet(db, sheet);
 
-    // 冻结：单价、班次、节假日、计划工量等影响工资的要素全部快照
+    // 冻结：仅快照本单实际引用的单价、班次，以及相关日期上的节假日；
+    // 未被本单使用的规则保持可维护，其他确认单各按自己的引用冻结。
+    var ref = result.referenced;
+    var refRateIds = {}; ref.rateIds.forEach(function (id) { refRateIds[id] = true; });
+    var refShiftIds = {}; ref.shiftIds.forEach(function (id) { refShiftIds[id] = true; });
+    var refDates = {}; ref.dates.forEach(function (d) { refDates[d] = true; });
     sheet.status = "confirmed";
     sheet.confirmedAt = newISO();
     sheet.frozen = {
       result: result,
-      rates: db.rates.map(clone),
-      shifts: db.shifts.map(clone),
-      holidays: db.holidays.slice(),
+      rates: db.rates.filter(function (r) { return refRateIds[r.id]; }).map(clone),
+      shifts: db.shifts.filter(function (s) { return refShiftIds[s.id]; }).map(clone),
+      holidays: db.holidays.filter(function (d) { return refDates[d]; }).slice(),
       holidayMultiplier: db.holidayMultiplier,
       overtimeRate: db.overtimeRate,
       plan: db.plan ? clone(db.plan) : null
@@ -503,6 +550,15 @@
     if (!sheet) throw new Error("工资单不存在");
     if (sheet.status !== "draft") throw new Error("已确认工资单不能补录明细，请开调整单");
     var clean = sanitizeEntry(entry);
+    // 入表即校验结算周期：生产日期与每段加班日期都必须在周期内
+    if (dayOrd(clean.date) < dayOrd(sheet.periodStart) || dayOrd(clean.date) > dayOrd(sheet.periodEnd)) {
+      throw new Error("生产日期 " + clean.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
+    }
+    clean.overtimes.forEach(function (o) {
+      if (dayOrd(o.date) < dayOrd(sheet.periodStart) || dayOrd(o.date) > dayOrd(sheet.periodEnd)) {
+        throw new Error("加班日期 " + o.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
+      }
+    });
     calcEntry(db, Object.assign({ advance: 0, otherDeduction: 0 }, clean)); // 先试算，非法不入表
     clean.id = "e" + (sheet.entries.length + 1) + "_" + (sheet.entries.reduce(function (mx, e) {
       var mm = /^e\d+_(\d+)$/.exec(e.id);
@@ -516,8 +572,9 @@
     if (!entry.date) throw new Error("请填写生产日期");
     parseDate(entry.date);
     ["qty", "reworkQty"].forEach(function (f) {
-      var v = Number(entry[f]);
-      if (!isFinite(v) || v < 0) throw new Error((f === "qty" ? "完成量" : "返工量") + "不能为负");
+      var raw = entry[f] === undefined || entry[f] === "" ? 0 : Number(entry[f]);
+      if (!isFinite(raw) || raw < 0) throw new Error((f === "qty" ? "完成量" : "返工量") + "不能为负");
+      entry[f] = raw;
     });
     if (entry.pieces != null && (Number(entry.pieces) < 1 || !isFinite(Number(entry.pieces)))) {
       throw new Error("件数至少为 1");
@@ -609,10 +666,17 @@
     hm(input.start); hm(input.end);
     var allowance = Number(input.allowance) || 0;
     if (allowance < 0) throw new Error("班次津贴不能为负");
+    var candidate = { name: name, start: input.start, end: input.end };
+    var clash = db.shifts.find(function (x) {
+      return x.id !== input.id && shiftsOverlap(candidate, x);
+    });
+    if (clash) {
+      throw new Error("班次「" + name + "」与已有班次「" + clash.name + "」时段重叠，保存会导致同一工时重复命中，请先调整边界");
+    }
     if (input.id) {
       var sh = db.shifts.filter(function (x) { return x.id === input.id; })[0];
       if (!sh) throw new Error("班次不存在");
-      if (shiftIsFrozen(db, sh.id)) throw new Error("该班次已被确认工资单锁定，不能修改");
+      if (shiftIsFrozen(db, sh.id)) throw new Error("该班次已被确认工资单引用并锁定，不能修改；请新增一个班次");
       sh.name = name; sh.start = input.start; sh.end = input.end; sh.allowance = r2(allowance);
       return sh;
     }
@@ -630,9 +694,19 @@
   function toggleHoliday(db, date) {
     parseDate(date);
     var i = db.holidays.indexOf(date);
-    if (i >= 0) db.holidays.splice(i, 1);
-    else db.holidays.push(date);
+    if (i >= 0) {
+      if (holidayIsFrozen(db, date)) {
+        throw new Error(date + " 已被确认工资单引用并锁定，不能取消；如需更正请在该单上开调整单");
+      }
+      db.holidays.splice(i, 1);
+    } else db.holidays.push(date);
     db.holidays.sort();
+  }
+  // 是否有已确认单在其计薪日期上实际用到该节假日
+  function holidayIsFrozen(db, date) {
+    return db.sheets.some(function (s) {
+      return s.status === "confirmed" && s.frozen && s.frozen.holidays.indexOf(date) >= 0;
+    });
   }
 
   /* ---------- 导出 / 导入复核 ---------- */
@@ -744,7 +818,8 @@
     addSheet: addSheet, updateDraft: updateDraft, addEntry: addEntry,
     removeEntry: removeEntry, removeSheet: removeSheet,
     addWeaver: addWeaver, setRate: setRate, setShift: setShift,
-    toggleHoliday: toggleHoliday, rateIsFrozen: rateIsFrozen, shiftIsFrozen: shiftIsFrozen,
+    toggleHoliday: toggleHoliday, holidayIsFrozen: holidayIsFrozen,
+    rateIsFrozen: rateIsFrozen, shiftIsFrozen: shiftIsFrozen,
     checksum: checksum, exportBundle: exportBundle, importBundle: importBundle,
     auditData: auditData, clone: clone
   };
