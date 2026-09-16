@@ -782,7 +782,16 @@
     var expectC = checksum(bundle.payload);
     if (expectC !== bundle.checksum) throw new Error("校验和不一致：文件可能被改动或损坏");
 
+    var structural = validateLedger(data);
+    if (structural.length) throw new Error("台账结构损坏，导入被拒绝：\n" + structural.slice(0, 8).join("\n"));
+
     var report = auditData(data);
+    if (!report.ok) {
+      var detail = report.sheets.filter(function (s) { return !s.ok; })
+        .map(function (s) { return s.id + "：" + s.errors.join("；"); }).slice(0, 5).join("\n");
+      throw new Error("台账复核不通过，导入被拒绝：\n" + detail);
+    }
+    return { data: data, pattern: bundle.payload.pattern || null, report: report, checksum: bundle.checksum };
     return { data: data, pattern: bundle.payload.pattern || null, report: report, checksum: bundle.checksum };
   }
 
@@ -793,7 +802,20 @@
     db.sheets.forEach(function (sheet) {
       var row = { id: sheet.id, status: sheet.status, ok: true, errors: [], warnings: [] };
       try {
-        if (sheet.status === "confirmed" && sheet.frozen) {
+        if (sheet.status === "confirmed") {
+          if (!sheet.frozen) {
+            row.ok = false;
+            row.errors.push("已确认单缺少冻结快照（数据损坏，不能复核）");
+            lines.push(row);
+            return;
+          }
+          var frozenStructure = frozenErrors(sheet);
+          if (frozenStructure.length) {
+            row.ok = false;
+            frozenStructure.forEach(function (e) { row.errors.push(e); });
+            lines.push(row);
+            return;
+          }
           // 先检查冻结结果自身的算术一致性（与重算规则无关）
           var ft = sheet.frozen.result.totals;
           var expectGross = r2(r2(ft.piecePay) + r2(ft.reworkPay) + r2(ft.overtimePay) + r2(ft.allowance));
@@ -846,6 +868,143 @@
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
   function newISO() { return new Date().toISOString(); }
 
+  /* ---------- 台账结构校验（导入前必过，坏档直接拒绝） ---------- */
+
+  function isNum(v) { return typeof v === "number" && isFinite(v); }
+  function isInt(v) { return isNum(v) && Math.floor(v) === v; }
+  function isValidDateStr(v) {
+    if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+    try { parseDate(v); return true; } catch (e) { return false; }
+  }
+  function isValidTimeStr(v) {
+    if (typeof v !== "string" || v === "") return true; // 时段可空（未排班）
+    try { hm(v); return true; } catch (e) { return false; }
+  }
+
+  // 已确认单的冻结快照是否结构合法且算术平衡；返回错误信息数组（空数组=合法）
+  function frozenErrors(sheet) {
+    var errs = [], label = "工资单 " + (sheet.id || "?");
+    var fz = sheet.frozen;
+    if (!fz || typeof fz !== "object") return [label + " 标记为已确认但缺少冻结快照"];
+    var res = fz.result;
+    if (!res || typeof res !== "object") { errs.push(label + " 冻结快照缺少计算结果"); return errs; }
+
+    if (!Array.isArray(res.lines) || !res.lines.length) errs.push(label + " 冻结结果缺少金额明细");
+    if (res.lines) res.lines.forEach(function (l, i) {
+      ["piecePay", "reworkPay", "overtimePay", "allowance", "gross"].forEach(function (k) {
+        if (!isNum(l[k])) errs.push(label + " 明细#" + (i + 1) + " 的 " + k + " 不是合法金额");
+      });
+      if (isNum(l.piecePay) && isNum(l.reworkPay) && isNum(l.overtimePay) && isNum(l.allowance) && isNum(l.gross)) {
+        var g = r2(l.piecePay + l.reworkPay + l.overtimePay + l.allowance);
+        if (g !== r2(l.gross)) errs.push(label + " 明细#" + (i + 1) + " 算不平：分项合计 " + g + " ≠ 小计 " + l.gross);
+      }
+      if (!Array.isArray(l.segments)) errs.push(label + " 明细#" + (i + 1) + " 缺少分段记录");
+    });
+
+    var t = res.totals;
+    if (!t || typeof t !== "object") { errs.push(label + " 冻结结果缺少合计"); return errs; }
+    ["piecePay", "reworkPay", "overtimePay", "allowance", "gross", "advance", "otherDeduction", "net"].forEach(function (k) {
+      if (!isNum(t[k])) errs.push(label + " 冻结合计 " + k + " 缺失或不是数字");
+    });
+    if (["piecePay", "reworkPay", "overtimePay", "allowance", "gross"].every(function (k) { return isNum(t[k]); })) {
+      var gross = r2(t.piecePay + t.reworkPay + t.overtimePay + t.allowance);
+      if (gross !== r2(t.gross)) errs.push(label + " 冻结应发算不平：" + t.gross + " ≠ 分项合计 " + gross);
+    }
+    if (isNum(t.gross) && isNum(t.advance) && isNum(t.otherDeduction) && isNum(t.net)) {
+      var net = r2(t.gross - t.advance - t.otherDeduction);
+      if (net !== r2(t.net)) errs.push(label + " 冻结实发算不平：" + t.net + " ≠ 应发-预支-扣款 " + net);
+      if (r2(t.advance) !== r2(sheet.advance) || r2(t.otherDeduction) !== r2(sheet.otherDeduction)) {
+        errs.push(label + " 冻结预支/扣款与单据不一致");
+      }
+    }
+    if (res.weaverId && res.weaverId !== sheet.weaverId) errs.push(label + " 冻结织工与单据不一致");
+
+    if (!Array.isArray(fz.rates)) errs.push(label + " 冻结快照缺少单价记录");
+    if (!Array.isArray(fz.shifts)) errs.push(label + " 冻结快照缺少班次记录");
+    if (!Array.isArray(fz.holidays)) errs.push(label + " 冻结快照缺少节假日记录");
+    if (!isNum(fz.holidayMultiplier)) errs.push(label + " 冻结快照缺少节假日倍数");
+    if (!isNum(fz.overtimeRate)) errs.push(label + " 冻结快照缺少加班时基");
+    if (fz.plan !== null && (typeof fz.plan !== "object")) errs.push(label + " 冻结计划工量类型错误");
+
+    // 冻结规则必须覆盖明细实际引用的单价与班次，否则重算必然失真
+    if (Array.isArray(fz.rates) && Array.isArray(res.lines)) {
+      var rateIds = {}; fz.rates.forEach(function (r) { rateIds[r.id] = true; });
+      res.lines.forEach(function (l, i) {
+        if (l.rateId && !rateIds[l.rateId]) errs.push(label + " 明细#" + (i + 1) + " 引用的单价不在冻结快照中");
+      });
+    }
+    if (Array.isArray(fz.shifts) && Array.isArray(res.lines)) {
+      var shiftIds = {}; fz.shifts.forEach(function (s) { shiftIds[s.id] = true; });
+      res.lines.forEach(function (l, i) {
+        (l.segments || []).forEach(function (sg) {
+          if (sg.shiftId && !shiftIds[sg.shiftId]) errs.push(label + " 明细#" + (i + 1) + " 引用的班次不在冻结快照中");
+        });
+      });
+    }
+    return errs;
+  }
+
+  // 整库结构校验；draft 宽、confirmed 严；返回错误信息数组
+  function validateLedger(data) {
+    var errs = [];
+    if (!data || typeof data !== "object") return ["台账不是有效对象"];
+    if (!Array.isArray(data.weavers)) errs.push("缺少织工表");
+    if (!Array.isArray(data.rates)) errs.push("缺少单价表");
+    if (!Array.isArray(data.shifts)) errs.push("缺少班次表");
+    if (!Array.isArray(data.sheets)) return errs.concat("缺少工资单表");
+    if (!Array.isArray(data.adjustments)) errs.push("缺少调整单表");
+
+    data.sheets.forEach(function (sheet) {
+      var label = "工资单 " + (sheet && sheet.id || "?");
+      if (!sheet || typeof sheet !== "object") { errs.push("存在非对象工资单"); return; }
+      if (typeof sheet.id !== "string" || !sheet.id) errs.push(label + " 缺少单号");
+      if (sheet.status !== "draft" && sheet.status !== "confirmed") errs.push(label + " 状态非法：" + sheet.status);
+      if (typeof sheet.weaverId !== "string" || !sheet.weaverId) errs.push(label + " 缺少织工");
+      if (!isValidDateStr(sheet.periodStart)) errs.push(label + " 周期起始日期非法");
+      if (!isValidDateStr(sheet.periodEnd)) errs.push(label + " 周期结束日期非法");
+      if (isValidDateStr(sheet.periodStart) && isValidDateStr(sheet.periodEnd) &&
+          dayOrd(sheet.periodEnd) < dayOrd(sheet.periodStart)) errs.push(label + " 周期起止颠倒");
+      ["advance", "otherDeduction"].forEach(function (k) {
+        if (sheet[k] != null && (!isNum(sheet[k]) || sheet[k] < 0)) errs.push(label + " 的 " + k + " 非法");
+      });
+      if (!Array.isArray(sheet.entries)) { errs.push(label + " 缺少明细数组"); }
+      else sheet.entries.forEach(function (en, i) {
+        var p = label + " 明细#" + (i + 1);
+        if (!en || typeof en !== "object") { errs.push(p + " 不是对象"); return; }
+        if (typeof en.processKey !== "string" || !en.processKey) errs.push(p + " 缺少工序");
+        if (!isValidDateStr(en.date)) errs.push(p + " 生产日期非法");
+        if (!isNum(en.qty) || en.qty < 0) errs.push(p + " 完成量非法");
+        if (!isNum(en.reworkQty) || en.reworkQty < 0) errs.push(p + " 返工量非法");
+        if (en.pieces != null && (!isNum(en.pieces) || en.pieces < 1)) errs.push(p + " 件数非法");
+        if (!isValidTimeStr(en.start) || !isValidTimeStr(en.end)) errs.push(p + " 上下班时间格式错误");
+        if (en.overtimes != null) {
+          if (!Array.isArray(en.overtimes)) errs.push(p + " 加班时段不是数组");
+          else (en.overtimes || []).forEach(function (o, j) {
+            if (!o || !isValidDateStr(o.date) || !isValidTimeStr(o.start) || !isValidTimeStr(o.end) || !o.start || !o.end) {
+              errs.push(p + " 加班段#" + (j + 1) + " 不完整或非法");
+            }
+          });
+        }
+      });
+      if (sheet.status === "confirmed") errs = errs.concat(frozenErrors(sheet));
+    });
+
+    // 调整单引用完整性
+    var sheetIds = {};
+    data.sheets.forEach(function (s) { sheetIds[s.id] = true; });
+    (data.adjustments || []).forEach(function (a, i) {
+      var p = "调整单#" + (i + 1);
+      if (!a || typeof a !== "object") { errs.push(p + " 不是对象"); return; }
+      if (typeof a.id !== "string" || !a.id) errs.push(p + " 缺少编号");
+      if (!sheetIds[a.sheetId]) errs.push(p + " 引用了不存在的工资单：" + a.sheetId);
+      if (!isNum(a.amount) || a.amount === 0) errs.push(p + " 金额非法或为 0");
+      if (!isValidDateStr(a.date)) errs.push(p + " 日期非法");
+      if (typeof a.reason !== "string" || !a.reason.trim()) errs.push(p + " 缺少原因");
+    });
+    return errs;
+  }
+
+
   var api = {
     r2: r2, pad: pad,
     parseDate: parseDate, dateStr: dateStr, addDays: addDays, todayStr: todayStr,
@@ -861,7 +1020,7 @@
     toggleHoliday: toggleHoliday, holidayIsFrozen: holidayIsFrozen,
     rateIsFrozen: rateIsFrozen, shiftIsFrozen: shiftIsFrozen,
     checksum: checksum, exportBundle: exportBundle, importBundle: importBundle,
-    auditData: auditData, clone: clone
+    auditData: auditData, validateLedger: validateLedger, frozenErrors: frozenErrors, clone: clone
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = api;

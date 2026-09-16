@@ -296,7 +296,22 @@ function runOldLedgerMigration() {
     ok(importedSheet.status === "confirmed" && Math.abs(importedSheet.frozen.result.totals.overtimePay - 100) < 1e-9,
       "【旧档】旧单冻结加班工资 100.00 保留");
     ok(wB.Payroll.auditData(stored).ok, "【旧档】落库后再次复核仍通过");
-    finish();
+
+    // 场景 C：损坏档（已确认但无冻结快照，且重算校验和绕开篡改检测）导入被界面拒绝，现有台账不被覆盖
+    const bad = wB.Payroll.exportBundle(stored);
+    delete bad.payload.data.sheets[0].frozen;
+    const badFile = new wB.File([JSON.stringify({ v: 1, payload: bad.payload, checksum: wB.Payroll.checksum(bad.payload) })],
+      "broken.json", { type: "application/json" });
+    const inp2 = dB.querySelector("#importFile");
+    Object.defineProperty(inp2, "files", { value: [badFile], configurable: true });
+    inp2.dispatchEvent(new wB.Event("change", { bubbles: true }));
+    setTimeout(() => {
+      const rejectMsg = dB.querySelector("#sMsg").textContent;
+      ok(/导入被拒绝/.test(rejectMsg) && /冻结快照/.test(rejectMsg), "【损坏档】界面导入被拒绝并说明原因");
+      const after = JSON.parse(wB.localStorage.getItem("zfl31Settlement"));
+      ok(after.sheets[0].status === "confirmed" && after.sheets[0].frozen, "【损坏档】坏档未落库，原台账保持完好");
+      finish();
+    }, 200);
   }, 200);
 }
 

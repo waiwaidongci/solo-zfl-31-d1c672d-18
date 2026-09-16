@@ -525,6 +525,108 @@ test("【旧档迁移】导入旧版台账文件即复核通过，无需手工�
   assert.strictEqual(imp.report.sheets[0].net, P.r2(frozen.totals.net - 0));
 });
 
+/* ---------- 损坏档回归：已确认单结构/算术校验，导入前拒绝 ---------- */
+
+// 产出一张结构完整的已确认台账（含调整单），各破坏用例在其副本上动手脚
+function goodConfirmedLedger() {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30", title: "9月" });
+  P.addEntry(db, sh.id, { processKey: "weaving", date: "2026-09-14", start: "09:00", end: "11:00", qty: 100 });
+  P.confirmSheet(db, sh.id);
+  P.addAdjustment(db, sh.id, { amount: -5, reason: "餐费", date: "2026-09-28" });
+  return db;
+}
+function tamperedFile(db, mutate) {
+  const b = P.exportBundle(db);
+  mutate(b.payload.data);
+  // 结构改动后重新算校验和（专门绕开“篡改检测”，验证结构校验本身）
+  return JSON.stringify({ v: 1, payload: b.payload, checksum: P.checksum(b.payload) });
+}
+
+test("【损坏档】完整确认单（含调整单）正常导入复核", () => {
+  const imp = P.importBundle(P.exportBundle(goodConfirmedLedger()).file);
+  assert.ok(imp.report.ok, JSON.stringify(imp.report.sheets, null, 2));
+  assert.strictEqual(imp.report.sheets[0].net, 80); // 冻结 85 - 调整 5
+});
+
+test("【损坏档】已确认但没有冻结快照 → 导入前拒绝，审计也判坏", () => {
+  const db = goodConfirmedLedger();
+  delete db.sheets[0].frozen;
+  // 直接审计（本地存储损坏路径）
+  const audit = P.auditData(db);
+  assert.ok(!audit.ok && /冻结快照/.test(audit.sheets[0].errors.join()));
+  // 导入路径（重算校验和以隔离结构校验）
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => delete d.sheets[0].frozen)), "结构损坏");
+});
+
+test("【损坏档】冻结结果缺金额明细/合计/类型错误 → 拒绝", () => {
+  const cases = [
+    d => { d.sheets[0].frozen.result.lines = []; },
+    d => { d.sheets[0].frozen.result.lines = null; },
+    d => { delete d.sheets[0].frozen.result.totals; },
+    d => { d.sheets[0].frozen.result.totals.net = "70.00"; },       // 类型错误（字符串）
+    d => { d.sheets[0].frozen.result.totals.net = NaN; },
+    d => { d.sheets[0].frozen.result.lines[0].gross = "abc"; },
+    d => { d.sheets[0].frozen.rates = null; },                       // 冻结规则缺失
+    d => { d.sheets[0].frozen.shifts = []; },                        // 实际命中早班却无班次记录
+  ];
+  cases.forEach((mutate, i) => {
+    expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), mutate)), "结构损坏");
+  });
+});
+
+test("【损坏档】冻结金额算不平（明细/合计/实发）→ 拒绝", () => {
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => {
+    d.sheets[0].frozen.result.totals.net = 999; // 与 gross-advance-deduction 不平
+  })), "算不平");
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => {
+    d.sheets[0].frozen.result.lines[0].gross += 50; // 明细分项和 ≠ 小计
+  })), "算不平");
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => {
+    d.sheets[0].frozen.result.totals.gross += 50; // 应发 ≠ 四分项
+  })), "算不平");
+  // auditData 对本地同样判坏
+  const db = goodConfirmedLedger();
+  db.sheets[0].frozen.result.totals.net = 1;
+  assert.ok(!P.auditData(db).ok);
+});
+
+test("【损坏档】冻结预支/扣款与单据不一致 → 拒绝", () => {
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => {
+    d.sheets[0].advance = 50; // 单据预支改了，冻结合计还是旧值
+  })), "不一致");
+});
+
+test("【损坏档】单据本体结构错误 → 拒绝", () => {
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => { d.sheets[0].weaverId = ""; })), "缺少织工");
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => { d.sheets[0].status = "weird"; })), "状态非法");
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => { d.sheets[0].entries[0].qty = -3; })), "完成量非法");
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => { d.sheets[0].periodEnd = "bad-date"; })), "日期非法");
+});
+
+test("【损坏档】孤儿调整单 / 调整单字段错误 → 拒绝", () => {
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => { d.adjustments[0].sheetId = "nope"; })), "不存在的工资单");
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => { d.adjustments[0].amount = 0; })), "金额非法");
+  expectThrow(() => P.importBundle(tamperedFile(goodConfirmedLedger(), d => { d.adjustments[0].reason = "  "; })), "缺少原因");
+});
+
+test("【损坏档】草稿结构宽松：无冻结也能导入，按严格规则审计", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  P.addEntry(db, sh.id, { processKey: "weaving", date: "2026-09-14", start: "09:00", end: "11:00", qty: 10 });
+  // 草稿无 frozen，结构校验应通过（草稿不要求冻结快照）
+  assert.deepStrictEqual(P.validateLedger(db).filter(e => /冻结/.test(e)), []);
+  const imp = P.importBundle(P.exportBundle(db).file);
+  assert.strictEqual(imp.data.sheets[0].status, "draft");
+});
+
+test("【损坏档】校验和失败仍优先报篡改（结构校验不掩盖完整性校验）", () => {
+  const file = P.exportBundle(goodConfirmedLedger()).file.replace('"net": 85', '"net": 850');
+  expectThrow(() => P.importBundle(file), "校验和");
+});
+
 /* ---------- 导出/导入复核 ---------- */
 test("导出再导入复核同一结果", () => {
   const { db, sh } = draftSheet();
