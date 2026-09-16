@@ -54,10 +54,15 @@
   }
   // 绝对分钟（基准日 00:00 起），允许跨夜（end < start 时加一天）
   function absMinutes(date, t) { return dayOrd(date) * 1440 + hm(t); }
-  // 半开工作区间 [起, 止)：仅当止“严格小于”起才按跨夜加一天；
-  // 起止时刻相同 = 零时长，拒绝（不能当 24 小时，否则会拿满全天津贴/加班费）
-  function workInterval(date, start, end, label) {
+  // 半开工作区间 [起, 止)：
+  // 严格模式：仅当止“严格小于”起才跨夜加一天；起止相同 = 零时长，拒绝；
+  // legacy 模式（复核旧版已确认单）：保持旧语义 end<=start 即加一天，相同时刻按 24 小时。
+  function workInterval(date, start, end, label, strict) {
     var s = absMinutes(date, start), e = absMinutes(date, end);
+    if (strict === false) {
+      if (e <= s) e += 1440;
+      return { start: s, end: e };
+    }
     if (e < s) e += 1440;
     if (e === s) throw new Error((label || "工作时段") + "的起止时刻相同（" + start + "–" + end + "），零时长不能计薪");
     return { start: s, end: e };
@@ -222,8 +227,8 @@
   // 把一段工作时间按“班次 × 是否节假日”切成计薪段
   // 输入：date + start/end（end<start 视为跨夜，end=start 视为零时长拒绝）
   // 输出每段：{minutes, shiftId|null, shiftName, allowance, holiday}
-  function splitSegments(db, date, start, end) {
-    var iv = workInterval(date, start, end, "工作时段");
+  function splitSegments(db, date, start, end, strict) {
+    var iv = workInterval(date, start, end, "工作时段", strict);
     var s = iv.start, e = iv.end;
 
     // 以班次边界为切点；未落入任何班次的部分归为“班外”段
@@ -267,8 +272,10 @@
   /* ---------- 单条完成量计薪 ---------- */
 
   // entry: { processKey, qty, reworkQty, date, start, end, advance, otherDeduction }
+  // opts.strict === false 时为 legacy 复核模式：零时长按旧版 24 小时语义，不套用新录入规则
   // 返回 { segments:[{…}], piecePay, reworkPay, overtimePay, allowance, gross, ... }
-  function calcEntry(db, entry) {
+  function calcEntry(db, entry, opts) {
+    var strict = !opts || opts.strict !== false;
     if (!entry.processKey) throw new Error("缺少工序");
     if (!entry.date) throw new Error("缺少生产日期");
     var qty = Number(entry.qty) || 0;
@@ -291,7 +298,7 @@
     // 分段（跨班次 / 跨节假日）
     var segs;
     if (entry.start && entry.end) {
-      segs = splitSegments(db, entry.date, entry.start, entry.end);
+      segs = splitSegments(db, entry.date, entry.start, entry.end, strict);
     } else {
       segs = [{
         start: 0, end: 0, minutes: 0,
@@ -333,11 +340,11 @@
     // 加班时段（与正常班次重叠要拦截）
     var overtimePay = 0;
     var overtimes = (entry.overtimes || []).map(function (o) {
-      var oiv = workInterval(o.date, o.start, o.end, "加班时段");
+      var oiv = workInterval(o.date, o.start, o.end, "加班时段", strict);
       var os = oiv.start, oe = oiv.end, mins = oe - os;
-      // 与该条生产时间重叠检测
+      // 与该条生产时间重叠检测（legacy 旧单同样有此校验，保持一致）
       if (entry.start && entry.end) {
-        var eiv = workInterval(entry.date, entry.start, entry.end, "生产时段");
+        var eiv = workInterval(entry.date, entry.start, entry.end, "生产时段", strict);
         if (overlap(oiv, eiv) > 0) {
           throw new Error("加班时段 " + o.date + " " + o.start + "-" + o.end + " 与正常班次重叠");
         }
@@ -382,7 +389,10 @@
 
   /* ---------- 工资单整单计算 ---------- */
 
-  function calcSheet(db, sheet) {
+  // opts.strict === false：复核旧版已确认单的 legacy 模式，
+  // 不套用“周期区间/零时长”等新录入校验，只按冻结规则重算金额。
+  function calcSheet(db, sheet, opts) {
+    var strict = !opts || opts.strict !== false;
     var weaver = findWeaver(db, sheet.weaverId);
     if (!weaver) throw new Error("缺少织工或织工已被删除");
     if (!sheet.periodStart || !sheet.periodEnd) throw new Error("结算周期不完整");
@@ -390,9 +400,10 @@
     if (!sheet.entries.length) throw new Error("没有任何完成量明细");
 
     var lines = sheet.entries.map(function (en) {
-      // 兜底校验（录入时已做，这里覆盖旧档/导入档）：日期、区间、加班都必须在周期内
-      assertEntryWithinPeriod(en, sheet);
-      return calcEntry(db, en);
+      // 严格模式（录入/草稿/确认）：日期与区间必须完全落在周期内；
+      // legacy 模式（复核旧已确认单）：跳过这些新规则，仅按当时冻结规则重算
+      if (strict) assertEntryWithinPeriod(en, sheet);
+      return calcEntry(db, en, { strict: strict });
     });
 
     var piecePay = r2(lines.reduce(function (a, l) { return a + l.piecePay; }, 0));
@@ -775,14 +786,22 @@
     return { data: data, pattern: bundle.payload.pattern || null, report: report, checksum: bundle.checksum };
   }
 
-  // 对整库做复核；draft 用当前规则重算，confirmed 用其冻结快照重算并逐分比对
+  // 对整库做复核；draft 用当前规则严格重算；
+  // confirmed 始终按其冻结规则以 legacy 模式重算（不套用升级后的新录入规则）并逐分比对。
   function auditData(db) {
     var lines = [];
     db.sheets.forEach(function (sheet) {
       var row = { id: sheet.id, status: sheet.status, ok: true, errors: [], warnings: [] };
       try {
         if (sheet.status === "confirmed" && sheet.frozen) {
-          // 用冻结的规则在一份临时库上重算
+          // 先检查冻结结果自身的算术一致性（与重算规则无关）
+          var ft = sheet.frozen.result.totals;
+          var expectGross = r2(r2(ft.piecePay) + r2(ft.reworkPay) + r2(ft.overtimePay) + r2(ft.allowance));
+          var expectNet = r2(r2(ft.gross) - r2(ft.advance) - r2(ft.otherDeduction));
+          if (expectGross !== r2(ft.gross)) { row.ok = false; row.errors.push("冻结应发合计内部不平：" + ft.gross + " ≠ 分项合计 " + expectGross); }
+          if (expectNet !== r2(ft.net)) { row.ok = false; row.errors.push("冻结实发内部不平：" + ft.net + " ≠ 应发-预支-扣款 " + expectNet); }
+
+          // 用冻结的规则在一份临时库上、以 legacy 语义重算（旧版跨月加班/相同时刻单按当时规则复算）
           var tmp = clone(db);
           tmp.rates = clone(sheet.frozen.rates);
           tmp.shifts = clone(sheet.frozen.shifts);
@@ -790,7 +809,7 @@
           tmp.holidayMultiplier = sheet.frozen.holidayMultiplier;
           tmp.overtimeRate = sheet.frozen.overtimeRate;
           tmp.plan = sheet.frozen.plan ? clone(sheet.frozen.plan) : null;
-          var recalced = calcSheet(tmp, sheet);
+          var recalced = calcSheet(tmp, sheet, { strict: false });
           var frozen = sheet.frozen.result.totals;
           var now = recalced.totals;
           ["piecePay", "reworkPay", "overtimePay", "allowance", "gross", "advance", "otherDeduction", "net"].forEach(function (f) {
@@ -804,6 +823,7 @@
           row.frozenNet = frozen.net;
           if (netWithAdj < 0) { row.ok = false; row.errors.push("含调整单后实发为负"); }
         } else if (sheet.status === "draft") {
+          // 草稿（含旧版遗留草稿）仍按当前严格规则重算，引导用户修正后再确认
           var live = calcSheet(db, sheet);
           row.net = live.totals.net;
           row.errors.push("（草稿）当前重算净额 " + live.totals.net);

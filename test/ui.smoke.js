@@ -246,6 +246,56 @@ ok(imp.report.sheets[0].net === 70, "导入后含调整单实发仍为 70.00");
   input.dispatchEvent(new dom2.window.Event("change", { bubbles: true }));
   setTimeout(() => {
     ok(/逐分一致/.test(dom2.window.document.querySelector("#sMsg").textContent), "界面导入提示逐分一致");
+    runOldLedgerMigration();
+  }, 200);
+}
+
+// 真实旧档迁移：升级前确认的“跨月加班单”，旧版全量冻结格式，升级后复核/导入不得判坏
+function runOldLedgerMigration() {
+  const P1 = win.Payroll;
+  const oldDb = P1.defaultData();
+  oldDb.plan = P1.generatePlan({ cols: 10, rows: 10, cells: new Array(100).fill(0) });
+  const sh = P1.addSheet(oldDb, { weaverId: "w1", periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+  sh.entries = [{
+    processKey: "weaving", date: "2026-08-31", start: "20:00", end: "22:00",
+    pieces: 1, qty: 20, reworkQty: 0,
+    overtimes: [{ date: "2026-08-31", start: "23:00", end: "01:00" }]
+  }];
+  // 旧版确认：legacy 语义重算 + 全量冻结快照
+  const frozen = P1.calcSheet(oldDb, sh, { strict: false });
+  sh.status = "confirmed";
+  sh.confirmedAt = "2026-08-31T10:00:00.000Z";
+  sh.frozen = {
+    result: frozen,
+    rates: oldDb.rates.map(P1.clone), shifts: oldDb.shifts.map(P1.clone),
+    holidays: oldDb.holidays.slice(), holidayMultiplier: oldDb.holidayMultiplier,
+    overtimeRate: oldDb.overtimeRate, plan: P1.clone(oldDb.plan)
+  };
+  const oldFile = P1.exportBundle(oldDb).file;
+
+  // 场景 A：模拟升级后首次刷新（旧档已在 localStorage），点“复核台账”
+  const domA = loadWindow({ zfl31Settlement: JSON.stringify(oldDb) });
+  const wA = domA.window, dA = wA.document;
+  dA.querySelector("#tabSettle").dispatchEvent(new wA.MouseEvent("click", { bubbles: true }));
+  byAct(dA.querySelector("#settleRoot"), "audit").dispatchEvent(new wA.MouseEvent("click", { bubbles: true }));
+  ok(/完全一致/.test(dA.querySelector("#sMsg").textContent), "【旧档】升级后复核旧跨月加班单：完全一致，不判越界");
+
+  // 场景 B：升级后通过文件导入旧版导出的台账
+  const domB = loadWindow();
+  const wB = domB.window, dB = wB.document;
+  dB.querySelector("#tabSettle").dispatchEvent(new wB.MouseEvent("click", { bubbles: true }));
+  const f = new wB.File([oldFile], "old-ledger.json", { type: "application/json" });
+  const inp = dB.querySelector("#importFile");
+  Object.defineProperty(inp, "files", { value: [f], configurable: true });
+  inp.dispatchEvent(new wB.Event("change", { bubbles: true }));
+  setTimeout(() => {
+    const msgText = dB.querySelector("#sMsg").textContent;
+    ok(/逐分一致/.test(msgText), "【旧档】导入旧版跨月加班台账：复核逐分一致");
+    const stored = JSON.parse(wB.localStorage.getItem("zfl31Settlement"));
+    const importedSheet = stored.sheets[0];
+    ok(importedSheet.status === "confirmed" && Math.abs(importedSheet.frozen.result.totals.overtimePay - 100) < 1e-9,
+      "【旧档】旧单冻结加班工资 100.00 保留");
+    ok(wB.Payroll.auditData(stored).ok, "【旧档】落库后再次复核仍通过");
     finish();
   }, 200);
 }

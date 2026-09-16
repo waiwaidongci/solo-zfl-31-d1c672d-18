@@ -413,6 +413,118 @@ test("【时间回归】边界修复后确认/冻结/导入复核保持不变", 
   assert.strictEqual(imp.report.sheets[0].net, res.totals.net);
 });
 
+/* ---------- 旧档迁移回归：升级后旧已确认单始终按冻结结果复核 ---------- */
+
+// 模拟“升级前版本”确认一张单：用 legacy 语义计算，并按旧版格式做全量冻结快照
+  // （旧版冻结整库 rates/shifts/holidays，且没有区间周期校验）
+  function confirmLikeOldVersion(db, sheet) {
+    var result = P.calcSheet(db, sheet, { strict: false });
+    sheet.status = "confirmed";
+    sheet.confirmedAt = "2026-08-31T10:00:00.000Z";
+    sheet.frozen = {
+      result: result,
+      rates: db.rates.map(P.clone),
+      shifts: db.shifts.map(P.clone),
+      holidays: db.holidays.slice(),
+      holidayMultiplier: db.holidayMultiplier,
+      overtimeRate: db.overtimeRate,
+      plan: db.plan ? P.clone(db.plan) : null
+    };
+    return result;
+  }
+
+test("【旧档迁移】跨月加班的旧已确认单：升级后复核不再判越界，金额逐分一致", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+  // 旧版允许：8/31 晚正常工 + 8/31 23:00→9/1 01:00 跨月加班，旧版按旧规则算出并冻结了金额
+  sh.entries = [{
+    processKey: "weaving", date: "2026-08-31", start: "20:00", end: "22:00",
+    pieces: 1, qty: 20, reworkQty: 0,
+    overtimes: [{ date: "2026-08-31", start: "23:00", end: "01:00" }]
+  }];
+  const oldResult = confirmLikeOldVersion(db, sh);
+  // 旧版实际发了：计件 20*0.8=16 + 加班 2h*25*2=100 + 中班津贴 8
+  assert.strictEqual(oldResult.totals.gross, P.r2(16 + 100 + 8));
+  assert.strictEqual(oldResult.totals.overtimePay, 100);
+
+  // 升级后严格规则下这笔是“不允许新建”的
+  expectThrow(() => P.calcSheet(db, sh), "拆成两笔");
+  // 但复核旧已确认单：按冻结规则 legacy 重算，逐分一致，通过
+  const audit = P.auditData(db);
+  assert.ok(audit.ok, JSON.stringify(audit.sheets, null, 2));
+  assert.strictEqual(audit.sheets[0].net, oldResult.totals.net);
+
+  // 导出再导入同样复核同一结果
+  const imp = P.importBundle(P.exportBundle(db).file);
+  assert.ok(imp.report.ok, JSON.stringify(imp.report.sheets, null, 2));
+  assert.strictEqual(imp.report.sheets[0].frozenNet, oldResult.totals.net);
+
+  // 旧单仍只能走调整单，调整后复核通过且不重放新规则
+  P.addAdjustment(db, sh.id, { amount: -5, reason: "旧档补扣款", date: "2026-09-02" });
+  assert.ok(P.auditData(db).ok);
+  assert.strictEqual(P.currentNet(db, sh), P.r2(oldResult.totals.net - 5));
+});
+
+test("【旧档迁移】相同时刻按 24h 计薪的旧已确认单：复核按冻结结果通过", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+  // 旧版 bug：start=end 按 24 小时，拿满三班津贴；金额已冻结
+  sh.entries = [{
+    processKey: "weaving", date: "2026-08-15", start: "08:00", end: "08:00",
+    pieces: 1, qty: 10, reworkQty: 0, overtimes: []
+  }];
+  const oldResult = confirmLikeOldVersion(db, sh);
+  // legacy 复核必须复现旧金额（含满全天 5+8+15=28 津贴）
+  assert.ok(P.auditData(db).ok, JSON.stringify(P.auditData(db).sheets, null, 2));
+  // 而新建/草稿严格模式仍拒绝零时长
+  expectThrow(() => P.calcEntry(db, sh.entries[0]), "零时长");
+  assert.strictEqual(P.auditData(db).sheets[0].frozenNet, oldResult.totals.net);
+});
+
+test("【旧档迁移】旧版遗留草稿仍按严格规则提示修正，不影响已确认单", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  // 一张旧确认单（合法）+ 一张旧草稿（含跨月加班）
+  const good = P.addSheet(db, { weaverId: "w1", periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+  P.addEntry(db, good.id, { processKey: "weaving", date: "2026-08-20", start: "09:00", end: "11:00", qty: 10 });
+  confirmLikeOldVersion(db, good);
+
+  const draft = P.addSheet(db, { weaverId: "w2", periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+  draft.entries = [{
+    processKey: "weaving", date: "2026-08-31", start: "20:00", end: "22:00",
+    pieces: 1, qty: 10, reworkQty: 0,
+    overtimes: [{ date: "2026-08-31", start: "23:00", end: "01:00" }]
+  }];
+  const audit = P.auditData(db);
+  // 整库复核不整体判坏：已确认单通过；草稿被严格规则标出（异常落在草稿行，不阻断确认单）
+  const goodRow = audit.sheets.find(r => r.id === good.id);
+  const draftRow = audit.sheets.find(r => r.id === draft.id);
+  assert.ok(goodRow.ok, "旧已确认单通过");
+  assert.ok(!draftRow.ok && /拆成两笔/.test(draftRow.errors.join()), "旧草稿按新规则提示拆分");
+  // 草稿修正后可正常确认
+  draft.entries[0].overtimes = [{ date: "2026-08-31", start: "22:00", end: "23:00" }];
+  assert.ok(P.confirmSheet(db, draft.id).totals.overtimePay > 0);
+  assert.ok(P.auditData(db).ok);
+});
+
+test("【旧档迁移】导入旧版台账文件即复核通过，无需手工迁移", () => {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-08-01", periodEnd: "2026-08-31" });
+  sh.entries = [{
+    processKey: "weaving", date: "2026-08-31", start: "20:00", end: "22:00",
+    pieces: 1, qty: 20, reworkQty: 0,
+    overtimes: [{ date: "2026-08-31", start: "23:00", end: "01:00" }]
+  }];
+  const frozen = confirmLikeOldVersion(db, sh);
+  const file = P.exportBundle(db).file; // 模拟升级前导出的旧档
+  const imp = P.importBundle(file);     // 升级后导入
+  assert.ok(imp.report.ok, JSON.stringify(imp.report.sheets, null, 2));
+  assert.strictEqual(imp.report.sheets[0].net, P.r2(frozen.totals.net - 0));
+});
+
 /* ---------- 导出/导入复核 ---------- */
 test("导出再导入复核同一结果", () => {
   const { db, sh } = draftSheet();
