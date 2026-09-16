@@ -307,6 +307,112 @@ test("【回归】只锁定实际引用的节假日，未引用日期可自由�
   assert.ok(P.auditData(db).ok);
 });
 
+/* ---------- 时间边界回归：首日 / 末日 / 零时长 / 跨夜 ---------- */
+
+function sepDb() {
+  const db = P.defaultData();
+  db.plan = P.generatePlan({ cols: 10, rows: 10, cells: Array(100).fill(0) });
+  return db;
+}
+const baseEntry = (over) => Object.assign({
+  processKey: "weaving", qty: 10, start: "09:00", end: "11:00"
+}, over);
+
+test("【时间回归】生产起止相同 → 拒绝，不当作 24 小时", () => {
+  const db = sepDb();
+  expectThrow(() => P.calcEntry(db, baseEntry({ date: "2026-09-15", start: "08:00", end: "08:00", qty: 10 })), "零时长");
+  expectThrow(() => P.addEntry(db, P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" }).id,
+    baseEntry({ date: "2026-09-15", start: "08:00", end: "08:00" })), "零时长");
+});
+
+test("【时间回归】加班起止相同 → 拒绝，不按一整天计费", () => {
+  const db = sepDb();
+  expectThrow(() => P.calcEntry(db, baseEntry({
+    date: "2026-09-15",
+    overtimes: [{ date: "2026-09-15", start: "19:00", end: "19:00" }]
+  })), "零时长");
+});
+
+test("【时间回归】末日深夜跨入次月（生产/加班）→ 拒绝，提示拆单", () => {
+  const db = sepDb();
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  // 9/30 22:00 → 10/01 06:00（夜班全段，含 6h 周期外），拒绝
+  expectThrow(() => P.addEntry(db, sh.id, baseEntry({
+    date: "2026-09-30", start: "22:00", end: "06:00", qty: 10
+  })), "拆成两笔");
+  // 9/30 生产正常，但 9/30 23:00→10/01 01:00 加班跨出周期，拒绝
+  expectThrow(() => P.addEntry(db, sh.id, baseEntry({
+    date: "2026-09-30", start: "20:00", end: "22:00", qty: 10,
+    overtimes: [{ date: "2026-09-30", start: "23:00", end: "01:00" }]
+  })), "拆成两笔");
+  assert.strictEqual(sh.entries.length, 0);
+});
+
+test("【时间回归】首日前跨入时段 → 拒绝", () => {
+  const db = sepDb();
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  // 8/31 23:00 上班、跨夜到 9/1 05:00 下班：起点在首日前，整笔拒绝（应拆到 8 月周期）
+  expectThrow(() => P.addEntry(db, sh.id, baseEntry({
+    date: "2026-08-31", start: "23:00", end: "05:00"
+  })), "不在结算周期");
+  // 首日凌晨的工时只能从 00:00 起：9/1 00:00-05:00 合法
+  P.addEntry(db, sh.id, baseEntry({ date: "2026-09-01", start: "00:00", end: "05:00", qty: 10 }));
+  assert.strictEqual(P.calcSheet(db, sh).lines[0].totalMinutes, 300);
+});
+
+test("【时间回归】末日做到 24:00 整、首日从 00:00 起 → 合法且不多算", () => {
+  const db = sepDb();
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  // 末日 22:00 → 24:00（= 10/1 00:00，正好贴周期边界），只含夜班 2h
+  P.addEntry(db, sh.id, baseEntry({ date: "2026-09-30", start: "22:00", end: "00:00", qty: 10 }));
+  const r = P.calcSheet(db, sh);
+  assert.strictEqual(r.lines[0].totalMinutes, 120);
+  assert.strictEqual(r.lines[0].segments.length, 1);
+  assert.strictEqual(r.lines[0].segments[0].shift, "夜班");
+  // 夜班津贴：只跨一个班次，覆盖满，给满 15
+  assert.strictEqual(r.totals.allowance, 15);
+  // 计件 10*0.8=8.0，无节假日
+  assert.strictEqual(r.totals.piecePay, 8);
+});
+
+test("【时间回归】周期中段跨夜班照常分段（非边界跨夜不被误伤）", () => {
+  const db = sepDb();
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  P.addEntry(db, sh.id, baseEntry({ date: "2026-09-14", start: "22:00", end: "06:00", qty: 80 }));
+  const r = P.calcSheet(db, sh);
+  assert.strictEqual(r.lines[0].totalMinutes, 480);
+  assert.strictEqual(r.lines[0].segments[0].shift, "夜班");
+  assert.strictEqual(r.lines[0].segments[0].minutes, 480);
+  assert.strictEqual(r.totals.piecePay, P.r2(80 * 0.8));
+});
+
+test("【时间回归】首日前跨加班 → 拒绝", () => {
+  const db = sepDb();
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  expectThrow(() => P.addEntry(db, sh.id, baseEntry({
+    date: "2026-09-01", start: "09:00", end: "11:00",
+    overtimes: [{ date: "2026-08-31", start: "23:00", end: "00:30" }]
+  })), "不在结算周期");
+});
+
+test("【时间回归】边界修复后确认/冻结/导入复核保持不变", () => {
+  const db = sepDb();
+  const sh = P.addSheet(db, { weaverId: "w1", periodStart: "2026-09-01", periodEnd: "2026-09-30" });
+  // 一笔跨中班/夜班边界的正常单（21:00-23:00）
+  P.addEntry(db, sh.id, baseEntry({ date: "2026-09-14", start: "21:00", end: "23:00", qty: 100 }));
+  P.updateDraft(db, sh.id, { advance: 10 });
+  const res = P.confirmSheet(db, sh.id);
+  // 100*0.8=80；津贴 中班 8*0.5 + 夜班 15*0.5 = 11.5；实发 81.5
+  assert.strictEqual(res.totals.gross, P.r2(80 + 11.5));
+  assert.strictEqual(res.totals.net, P.r2(80 + 11.5 - 10));
+  // 冻结精确到引用的两个班次
+  assert.deepStrictEqual(sh.frozen.shifts.map(s => s.name).sort(), ["中班", "夜班"]);
+  // 导出再导入复核逐分一致
+  const imp = P.importBundle(P.exportBundle(db).file);
+  assert.ok(imp.report.ok, JSON.stringify(imp.report.sheets, null, 2));
+  assert.strictEqual(imp.report.sheets[0].net, res.totals.net);
+});
+
 /* ---------- 导出/导入复核 ---------- */
 test("导出再导入复核同一结果", () => {
   const { db, sh } = draftSheet();

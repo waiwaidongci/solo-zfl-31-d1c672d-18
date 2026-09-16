@@ -193,6 +193,26 @@ setVal(doc.querySelector('[data-box="entry"] [name=ot1end]'), "10:00");
 clickAct(win, doc.querySelector("#settleRoot"), "addEntry");
 ok(/不在结算周期/.test(msg(dom)), "周期外加班明细被拦截（生产日期在周期内也不行）");
 ok(JSON.parse(win.localStorage.getItem("zfl31Settlement")).sheets.find(s=>s.id===sh2Id).entries.length === 0, "非法加班明细未入表");
+
+// 零时长：起止时刻相同 → 拒绝（不能当 24 小时）
+setVal(doc.querySelector('[data-box="entry"] [name=ot1date]'), "");
+setVal(doc.querySelector('[data-box="entry"] [name=ot1start]'), "");
+setVal(doc.querySelector('[data-box="entry"] [name=ot1end]'), "");
+setVal(doc.querySelector('[data-box="entry"] [name=start]'), "20:00");
+setVal(doc.querySelector('[data-box="entry"] [name=end]'), "20:00");
+clickAct(win, doc.querySelector("#settleRoot"), "addEntry");
+ok(/零时长/.test(msg(dom)), "生产起止相同时刻被拒绝（不按 24 小时计）");
+// 末日 22:00→次日06:00 跨入 10 月 → 拒绝
+setVal(doc.querySelector('[data-box="entry"] [name=date]'), "2026-09-30");
+setVal(doc.querySelector('[data-box="entry"] [name=start]'), "22:00");
+setVal(doc.querySelector('[data-box="entry"] [name=end]'), "06:00");
+clickAct(win, doc.querySelector("#settleRoot"), "addEntry");
+ok(/拆成两笔/.test(msg(dom)), "末日深夜跨入次月被拒绝并提示拆单");
+// 末日做到 24:00 整合法
+setVal(doc.querySelector('[data-box="entry"] [name=start]'), "22:00");
+setVal(doc.querySelector('[data-box="entry"] [name=end]'), "00:00");
+clickAct(win, doc.querySelector("#settleRoot"), "addEntry");
+ok(/加入明细成功/.test(msg(dom)), "末日 22:00–24:00 贴边界合法计入");
 clickAct(win, doc.querySelector("#settleRoot"), "back");
 // 删除这张空草稿，避免污染后续导出复核
 doc.querySelector('[data-act="deleteSheet"][data-id="' + sh2Id + '"]').dispatchEvent(new win.MouseEvent("click", { bubbles: true }));

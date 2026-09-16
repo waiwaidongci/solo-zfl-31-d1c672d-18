@@ -54,6 +54,42 @@
   }
   // 绝对分钟（基准日 00:00 起），允许跨夜（end < start 时加一天）
   function absMinutes(date, t) { return dayOrd(date) * 1440 + hm(t); }
+  // 半开工作区间 [起, 止)：仅当止“严格小于”起才按跨夜加一天；
+  // 起止时刻相同 = 零时长，拒绝（不能当 24 小时，否则会拿满全天津贴/加班费）
+  function workInterval(date, start, end, label) {
+    var s = absMinutes(date, start), e = absMinutes(date, end);
+    if (e < s) e += 1440;
+    if (e === s) throw new Error((label || "工作时段") + "的起止时刻相同（" + start + "–" + end + "），零时长不能计薪");
+    return { start: s, end: e };
+  }
+  // 结算周期的绝对半开区间：[首日 00:00, 末日次日 00:00)
+  function periodBounds(periodStart, periodEnd) {
+    return { start: dayOrd(periodStart) * 1440, end: (dayOrd(periodEnd) + 1) * 1440 };
+  }
+  function assertIntervalInPeriod(iv, sheet, label) {
+    var b = periodBounds(sheet.periodStart, sheet.periodEnd);
+    if (iv.start < b.start || iv.end > b.end) {
+      throw new Error(label + "超出结算周期 " + sheet.periodStart + "~" + sheet.periodEnd +
+        "：跨周期的时段请拆成两笔，周期外部分录到下一周期");
+    }
+  }
+  // 一条明细（生产时段 + 每段加班）必须整体落在结算周期内
+  function assertEntryWithinPeriod(en, sheet) {
+    if (dayOrd(en.date) < dayOrd(sheet.periodStart) || dayOrd(en.date) > dayOrd(sheet.periodEnd)) {
+      throw new Error("生产日期 " + en.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
+    }
+    if (en.start) {
+      assertIntervalInPeriod(workInterval(en.date, en.start, en.end, "生产时段"),
+        sheet, en.date + " " + en.start + "–" + en.end + " 的生产时段");
+    }
+    (en.overtimes || []).forEach(function (o) {
+      if (dayOrd(o.date) < dayOrd(sheet.periodStart) || dayOrd(o.date) > dayOrd(sheet.periodEnd)) {
+        throw new Error("加班日期 " + o.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
+      }
+      assertIntervalInPeriod(workInterval(o.date, o.start, o.end, "加班时段"),
+        sheet, "加班 " + o.date + " " + o.start + "–" + o.end);
+    });
+  }
 
   /* ---------- 基础数据 ---------- */
 
@@ -184,12 +220,11 @@
   }
 
   // 把一段工作时间按“班次 × 是否节假日”切成计薪段
-  // 输入：date + start/end（end<=start 视为跨夜）
+  // 输入：date + start/end（end<start 视为跨夜，end=start 视为零时长拒绝）
   // 输出每段：{minutes, shiftId|null, shiftName, allowance, holiday}
   function splitSegments(db, date, start, end) {
-    var s = absMinutes(date, start), e = absMinutes(date, end);
-    if (e <= s) e += 1440;
-    if (e <= s) throw new Error("工作时长必须大于 0");
+    var iv = workInterval(date, start, end, "工作时段");
+    var s = iv.start, e = iv.end;
 
     // 以班次边界为切点；未落入任何班次的部分归为“班外”段
     var cuts = {};
@@ -298,14 +333,12 @@
     // 加班时段（与正常班次重叠要拦截）
     var overtimePay = 0;
     var overtimes = (entry.overtimes || []).map(function (o) {
-      var os = absMinutes(o.date, o.start), oe = absMinutes(o.date, o.end);
-      if (oe <= os) oe += 1440;
-      var mins = oe - os;
+      var oiv = workInterval(o.date, o.start, o.end, "加班时段");
+      var os = oiv.start, oe = oiv.end, mins = oe - os;
       // 与该条生产时间重叠检测
       if (entry.start && entry.end) {
-        var es = absMinutes(entry.date, entry.start), ee = absMinutes(entry.date, entry.end);
-        if (ee <= es) ee += 1440;
-        if (overlap({ start: os, end: oe }, { start: es, end: ee }) > 0) {
+        var eiv = workInterval(entry.date, entry.start, entry.end, "生产时段");
+        if (overlap(oiv, eiv) > 0) {
           throw new Error("加班时段 " + o.date + " " + o.start + "-" + o.end + " 与正常班次重叠");
         }
       }
@@ -357,15 +390,8 @@
     if (!sheet.entries.length) throw new Error("没有任何完成量明细");
 
     var lines = sheet.entries.map(function (en) {
-      if (dayOrd(en.date) < dayOrd(sheet.periodStart) || dayOrd(en.date) > dayOrd(sheet.periodEnd)) {
-        throw new Error("明细日期 " + en.date + " 不在结算周期内");
-      }
-      // 每段加班同样必须落在结算周期内（加班日期与生产日期可以不同，如跨月加班）
-      (en.overtimes || []).forEach(function (o) {
-        if (dayOrd(o.date) < dayOrd(sheet.periodStart) || dayOrd(o.date) > dayOrd(sheet.periodEnd)) {
-          throw new Error("加班日期 " + o.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
-        }
-      });
+      // 兜底校验（录入时已做，这里覆盖旧档/导入档）：日期、区间、加班都必须在周期内
+      assertEntryWithinPeriod(en, sheet);
       return calcEntry(db, en);
     });
 
@@ -550,15 +576,8 @@
     if (!sheet) throw new Error("工资单不存在");
     if (sheet.status !== "draft") throw new Error("已确认工资单不能补录明细，请开调整单");
     var clean = sanitizeEntry(entry);
-    // 入表即校验结算周期：生产日期与每段加班日期都必须在周期内
-    if (dayOrd(clean.date) < dayOrd(sheet.periodStart) || dayOrd(clean.date) > dayOrd(sheet.periodEnd)) {
-      throw new Error("生产日期 " + clean.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
-    }
-    clean.overtimes.forEach(function (o) {
-      if (dayOrd(o.date) < dayOrd(sheet.periodStart) || dayOrd(o.date) > dayOrd(sheet.periodEnd)) {
-        throw new Error("加班日期 " + o.date + " 不在结算周期 " + sheet.periodStart + "~" + sheet.periodEnd + " 内");
-      }
-    });
+    // 入表即校验结算周期：生产日期、生产区间、每段加班日期与区间都必须完全落在周期内
+    assertEntryWithinPeriod(clean, sheet);
     calcEntry(db, Object.assign({ advance: 0, otherDeduction: 0 }, clean)); // 先试算，非法不入表
     clean.id = "e" + (sheet.entries.length + 1) + "_" + (sheet.entries.reduce(function (mx, e) {
       var mm = /^e\d+_(\d+)$/.exec(e.id);
@@ -588,6 +607,7 @@
     var overtimes = (entry.overtimes || []).map(function (o) {
       if (!o.date || !o.start || !o.end) throw new Error("加班时段不完整");
       parseDate(o.date); hm(o.start); hm(o.end);
+      workInterval(o.date, o.start, o.end, "加班时段"); // 起止相同直接拒绝
       return { date: o.date, start: o.start, end: o.end };
     });
     return {

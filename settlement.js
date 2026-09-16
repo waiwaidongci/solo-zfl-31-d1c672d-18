@@ -353,7 +353,7 @@
         "<label>加班2日期<input type='date' name='ot2date' min='" + sh.periodStart + "' max='" + sh.periodEnd + "'></label>" +
         "<label>起<input type='time' name='ot2start'></label><label>止<input type='time' name='ot2end'></label>" +
         '<p style="grid-column:1/-1;margin:4px 0"><button class="tiny" data-act="addEntry">加入明细（先试算再入表）</button> ' +
-        "<span class='muted'>返工按工序返工系数计，不享节假日倍数；加班不得与正常班次重叠。</span></p>" +
+        "<span class='muted'>返工按工序返工系数计，不享节假日倍数；加班不得与正常班次重叠。跨周期的夜班请拆成两笔（末日最多做到 24:00，首日前跨入的部分归上一周期），起止时刻相同会按零时长拒绝。</span></p>" +
       "</div>";
   }
 
