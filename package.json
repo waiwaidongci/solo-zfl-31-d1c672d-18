@@ -1,0 +1,14 @@
+{
+  "name": "brocade-workbench",
+  "version": "1.0.0",
+  "description": "手工织锦纹样排版台 + 织造计件结算台（零依赖纯前端，打开 index.html 即用）",
+  "private": true,
+  "scripts": {
+    "test": "node test/payroll.test.js",
+    "test-ui": "node test/ui.smoke.js",
+    "test-all": "node test/payroll.test.js && node test/ui.smoke.js"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

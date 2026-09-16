@@ -27,15 +27,53 @@
     .mini { aspect-ratio: 1; border-radius: 2px; }
     .toolbar { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .warning { color: #a03a2e; font-weight: 800; }
+    /* 顶部视图切换 */
+    nav.tabs { display: flex; gap: 6px; }
+    nav.tabs button { background: #e6dccb; color: #5a4d40; padding: 9px 16px; border-radius: 8px 8px 0 0; }
+    nav.tabs button.active { background: #8d3e37; color: #fff; }
+    /* 结算台 */
+    #settleView { padding: 16px; }
+    .s-hidden { display: none !important; }
+    .s-subtabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+    .s-subtabs button { background: #e6dccb; color: #5a4d40; }
+    .s-subtabs button.active { background: #713d7b; color: #fff; }
+    .s-subtabs .spacer { flex: 1; }
+    .s-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+    .s-card { background: #fffaf2; border: 1px solid #d9cdbc; border-radius: 8px; padding: 14px; }
+    .s-card h3 { margin: 0 0 8px; font-size: 16px; }
+    table.s-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.s-table th, table.s-table td { border-bottom: 1px solid #e7dccb; padding: 6px 8px; text-align: left; vertical-align: top; }
+    table.s-table th { color: #76695e; font-weight: 700; background: #f7efdf; }
+    .s-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; align-items: end; }
+    .s-row label { margin: 0; }
+    .badge { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 700; }
+    .badge.draft { background: #ece3d2; color: #6b5d4d; }
+    .badge.confirmed { background: #dceadd; color: #2c6632; }
+    .money { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+    .total-line { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed #ddd0bd; }
+    .total-line.net { font-weight: 800; font-size: 16px; border-bottom: 0; }
+    #sMsg { position: sticky; top: 6px; z-index: 5; margin-bottom: 10px; padding: 10px 14px; border-radius: 8px; display: none; font-weight: 700; }
+    #sMsg.ok { display: block; background: #dceadd; color: #2c6632; border: 1px solid #9ec7a4; }
+    #sMsg.err { display: block; background: #f6dcd8; color: #a03a2e; border: 1px solid #dda79f; }
+    .seg-chip { display: inline-block; background: #f1e6d3; border-radius: 6px; padding: 1px 7px; margin: 1px 2px; font-size: 12px; white-space: nowrap; }
+    .seg-chip.hol { background: #f3d9d6; color: #a03a2e; }
+    button.tiny { padding: 4px 9px; font-size: 12px; border-radius: 6px; }
+    button.ghost { background: #e6dccb; color: #5a4d40; }
+    button.danger { background: #a03a2e; }
+    .muted { color: #8a7c6d; font-size: 12px; }
+    .locked-note { background: #f3e9d8; border: 1px solid #ddc69b; border-radius: 6px; padding: 8px 10px; font-size: 13px; margin: 8px 0; }
     @media (max-width: 1000px) { header { display: block; } .app { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <header>
-    <div><h1>手工织锦纹样排版台</h1><div>绘制经纬网格纹样，统计色线用量并保存方案。</div></div>
-    <div class="toolbar"><button id="saveBtn">保存方案</button><button id="exportBtn" class="secondary">导出JSON</button></div>
+    <div><h1>手工织锦工作台</h1><div>纹样排版台 · 织造计件结算台</div></div>
+    <nav class="tabs">
+      <button id="tabPattern" class="active">纹样排版台</button>
+      <button id="tabSettle">织造计件结算台</button>
+    </nav>
   </header>
-  <main class="app">
+  <main id="patternView" class="app">
     <aside class="panel">
       <h2>画布</h2>
       <label>经向列数</label><input id="cols" type="number" value="18" min="6" max="36">
@@ -49,6 +87,8 @@
         <button data-block="cross" class="secondary">十字</button>
         <button data-block="diamond" class="secondary">小菱形</button>
       </div>
+      <h2>方案</h2>
+      <div class="toolbar"><button id="saveBtn">保存方案</button><button id="exportBtn" class="secondary">导出JSON</button></div>
     </aside>
     <section class="panel"><div class="grid" id="grid"></div></section>
     <aside class="panel">
@@ -63,6 +103,11 @@
       <div id="risk"></div>
     </aside>
   </main>
+  <main id="settleView" class="s-hidden">
+    <div id="sMsg"></div>
+    <div id="settleRoot"></div>
+  </main>
+  <script src="payroll.js"></script>
   <script>
     const colors = ["#f7e7c4","#a6322d","#1f5f78","#d6a437","#355b38","#713d7b","#1e1b18","#e98c52"];
     const grid = document.querySelector("#grid");
@@ -129,6 +174,10 @@
       const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "brocade-pattern.json"; a.click(); URL.revokeObjectURL(a.href);
     };
     init();
+    // 供织造计件结算台读取“当前纹样”（绘制中的最新状态）/ 从导入档重载
+    window.getPatternData = () => ({ cols, rows, cells, name: (JSON.parse(localStorage.getItem("zfl31Pattern")||"null")||{}).name || "" });
+    window.initPattern = () => { undo = []; redo = []; init(true); };
   </script>
+  <script src="settlement.js"></script>
 </body>
 </html>
